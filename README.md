@@ -4,9 +4,10 @@ A local, privacy-friendly resume screening API and dashboard. It accepts text or
 
 ## Run
 
-Use Python 3.11+ with `pypdf` installed, then:
+Use Python 3.11+, then:
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 app.py
 ```
 
@@ -18,9 +19,24 @@ Open `http://127.0.0.1:8000`. Upload a PDF or `.txt` resume (or paste text), the
 
 `POST /api/resumes` parses text or PDF; `GET /api/candidates` lists extracted records; `POST /api/screen` returns ranked matches. The score combines recognized-skill coverage (65%), job/resume term overlap (25%), and stated-experience fit (10%). This makes each result reproducible and easy to audit.
 
-## LLM enhancement prompt
+## LLM scoring
 
-Use an LLM only after deterministic extraction and keep a human in the loop:
+The application uses OpenAI structured output whenever `OPENAI_API_KEY` is configured;
+otherwise it automatically falls back to the transparent rules score. Configure it on the
+server (never in browser JavaScript):
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-5-mini" # optional
+python3 app.py
+```
+
+The server asks the model for a schema-validated score, matched requirements, gaps, and an
+evidence-based justification. It rejects malformed output and returns the rules fallback if
+the provider is unavailable. Resume text is sent to the configured LLM provider only when
+this option is enabled, so obtain appropriate consent and follow your retention policy.
+
+The evaluation instructions are:
 
 ```text
 Compare the candidate profile with the job description. Return JSON with a fit score 1-10,
@@ -29,7 +45,7 @@ Do not infer or use protected characteristics (age, race, gender, disability, re
 nationality, or marital/family status). Cite only evidence present in the supplied text.
 ```
 
-The included app deliberately works without API keys; an LLM provider can be added behind the `/api/screen` stage while retaining this validation and audit trail.
+The UI labels each result as an LLM assessment or rules fallback for auditability.
 
 ## Responsible use
 

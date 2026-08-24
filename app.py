@@ -5,14 +5,11 @@ import json
 import os
 import re
 import sqlite3
-import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "data" / "screener.db"
@@ -115,7 +112,55 @@ def score(candidate: Candidate, job_description: str) -> dict:
     reason = f"Matched skills: {', '.join(matched) or 'none identified'}."
     if missing: reason += f" Gaps: {', '.join(missing)}."
     if years_req: reason += f" Experience: {candidate.experience_years or 0:g} years identified (role asks {years_req:g})."
-    return {"candidate": public_candidate(candidate), "score": score_10, "matched_skills": matched, "missing_skills": missing, "justification": reason}
+    return {"candidate": public_candidate(candidate), "score": score_10, "matched_skills": matched, "missing_skills": missing, "justification": reason, "scoring_method": "rules_fallback"}
+
+LLM_INSTRUCTIONS = """You evaluate resume fit only as decision support for a human recruiter.
+Use only evidence from the supplied resume and job description. Do not infer or consider
+protected characteristics, including age, race, ethnicity, gender, disability, religion,
+nationality, marital status, or family status. Return a balanced fit score and concise,
+evidence-based rationale. Do not make a hiring decision."""
+
+FIT_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "score": {"type": "number"},
+        "matched_requirements": {"type": "array", "items": {"type": "string"}},
+        "gaps": {"type": "array", "items": {"type": "string"}},
+        "justification": {"type": "string"},
+    },
+    "required": ["score", "matched_requirements", "gaps", "justification"],
+}
+
+def llm_score(candidate: Candidate, job_description: str) -> dict | None:
+    """Return a validated LLM result, or None when LLM scoring is unavailable."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    try:
+        from openai import OpenAI
+        response = OpenAI().responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+            store=False,
+            instructions=LLM_INSTRUCTIONS,
+            input=json.dumps({"candidate": public_candidate(candidate), "resume": candidate.resume_text,
+                              "job_description": job_description}),
+            text={"format": {"type": "json_schema", "name": "candidate_fit", "strict": True, "schema": FIT_SCHEMA}},
+        )
+        result = json.loads(response.output_text)
+        score_10 = float(result["score"])
+        matches, gaps, justification = result["matched_requirements"], result["gaps"], result["justification"]
+        if (not 0 <= score_10 <= 10 or not isinstance(matches, list) or not isinstance(gaps, list)
+                or not all(isinstance(item, str) for item in matches + gaps)
+                or not isinstance(justification, str) or not 1 <= len(justification.strip()) <= 800):
+            raise ValueError("LLM result did not meet validation requirements")
+        return {"candidate": public_candidate(candidate), "score": round(score_10, 1),
+                "matched_skills": matches, "missing_skills": gaps,
+                "justification": justification.strip(), "scoring_method": "llm"}
+    except Exception:
+        # Screening remains available if credentials, the provider, or output validation fail.
+        return None
+
+def screen_candidate(candidate: Candidate, job_description: str) -> dict:
+    return llm_score(candidate, job_description) or score(candidate, job_description)
 
 def public_candidate(c: Candidate) -> dict:
     result = asdict(c); result.pop("resume_text", None); return result
@@ -152,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/screen":
                 payload = json.loads(self.read_body()); job = payload.get("job_description", "").strip()
                 if not job: raise ValueError("A job description is required.")
-                threshold = float(payload.get("minimum_score", 0)); results = [score(c, job) for c in list_candidates()]
+                threshold = float(payload.get("minimum_score", 0)); results = [screen_candidate(c, job) for c in list_candidates()]
                 self.send_json(sorted([r for r in results if r["score"] >= threshold], key=lambda r: r["score"], reverse=True))
             else: self.send_json({"error": "Not found"}, 404)
         except (ValueError, json.JSONDecodeError) as exc: self.send_json({"error": str(exc)}, 400)
