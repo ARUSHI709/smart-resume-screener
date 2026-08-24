@@ -100,19 +100,36 @@ def job_terms(job: str) -> set[str]:
     return {w for w in words if w not in STOPWORDS}
 
 def score(candidate: Candidate, job_description: str) -> dict:
-    job_skills = set(find_skills(job_description)); candidate_skills = set(candidate.skills)
-    matched = sorted(job_skills & candidate_skills); missing = sorted(job_skills - candidate_skills)
-    terms = job_terms(job_description); resume_words = set(re.findall(r"[a-z][a-z+#.]{1,}", normalize(candidate.resume_text)))
-    lexical = len(terms & resume_words) / len(terms) if terms else 0
-    skill_coverage = len(matched) / len(job_skills) if job_skills else lexical
-    years_req = extract_years(job_description)
-    years_fit = 1 if not years_req else min((candidate.experience_years or 0) / years_req, 1)
-    raw = .65 * skill_coverage + .25 * lexical + .10 * years_fit
-    score_10 = round(raw * 10, 1)
-    reason = f"Matched skills: {', '.join(matched) or 'none identified'}."
-    if missing: reason += f" Gaps: {', '.join(missing)}."
-    if years_req: reason += f" Experience: {candidate.experience_years or 0:g} years identified (role asks {years_req:g})."
-    return {"candidate": public_candidate(candidate), "score": score_10, "matched_skills": matched, "missing_skills": missing, "justification": reason, "scoring_method": "rules_fallback"}
+    """Calculate the transparent baseline score shown when LLM scoring is unavailable."""
+    job_skills = set(find_skills(job_description))
+    candidate_skills = set(candidate.skills)
+    matched = sorted(job_skills & candidate_skills)
+    missing = sorted(job_skills - candidate_skills)
+
+    terms = job_terms(job_description)
+    resume_words = set(re.findall(r"[a-z][a-z+#.]{1,}", normalize(candidate.resume_text)))
+    lexical_overlap = len(terms & resume_words) / len(terms) if terms else 0
+    skill_coverage = len(matched) / len(job_skills) if job_skills else lexical_overlap
+
+    years_required = extract_years(job_description)
+    years_fit = 1 if not years_required else min((candidate.experience_years or 0) / years_required, 1)
+    score_10 = round((0.65 * skill_coverage + 0.25 * lexical_overlap + 0.10 * years_fit) * 10, 1)
+
+    justification = f"Matched skills: {', '.join(matched) or 'none identified'}."
+    if missing:
+        justification += f" Gaps: {', '.join(missing)}."
+    if years_required:
+        years_found = candidate.experience_years or 0
+        justification += f" Experience: {years_found:g} years identified (role asks {years_required:g})."
+
+    return {
+        "candidate": public_candidate(candidate),
+        "score": score_10,
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "justification": justification,
+        "scoring_method": "rules_fallback",
+    }
 
 LLM_INSTRUCTIONS = """You evaluate resume fit only as decision support for a human recruiter.
 Use only evidence from the supplied resume and job description. Do not infer or consider
@@ -163,7 +180,9 @@ def screen_candidate(candidate: Candidate, job_description: str) -> dict:
     return llm_score(candidate, job_description) or score(candidate, job_description)
 
 def public_candidate(c: Candidate) -> dict:
-    result = asdict(c); result.pop("resume_text", None); return result
+    result = asdict(c)
+    result.pop("resume_text", None)
+    return result
 
 def extract_pdf(content: bytes) -> str:
     try:
